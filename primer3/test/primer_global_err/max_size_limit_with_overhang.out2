@@ -1,0 +1,1 @@
+../src/primer3_core: PRIMER_MAX_SIZE + SEQUENCE_OVERHANG_LEFT exceeds built-in maximum of 60
