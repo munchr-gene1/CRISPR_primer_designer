@@ -32,8 +32,8 @@ class CutSite:
     extra_data: Dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self):
-        # Clean the sequence (remove spaces, uppercase)
-        self.sequence = self.sequence.strip().upper().replace(" ", "")
+        # Clean the sequence (remove spaces, uppercase, uracil to thymine)
+        self.sequence = self.sequence.strip().upper().replace(" ", "").replace("U", "T")
 
 
 @dataclass
@@ -145,10 +145,11 @@ class Primer3InputGenerator:
         return matches
 
     def _reverse_complement(self, seq: str) -> str:
-        """Generate reverse complement of a DNA sequence"""
-        complement = {'A': 'T', 'T': 'A', 'G': 'C', 'C': 'G',
+        """Generate reverse complement of a sequence (handles DNA and RNA)"""
+        complement = {'A': 'T', 'T': 'A', 'U': 'A', 'G': 'C', 'C': 'G',
                       'N': 'N', 'R': 'Y', 'Y': 'R', 'M': 'K',
                       'K': 'M', 'S': 'S', 'W': 'W'}
+        # seq is already upper-cased by find_sequence_in_template but we do it again for safety
         return ''.join(complement.get(base, 'N') for base in reversed(seq.upper()))
 
     def parse_location(self, location_str: str) -> Tuple[Optional[str], Optional[int], Optional[int]]:
@@ -838,7 +839,7 @@ class CRISPRPrimerDesigner:
                     if current_name and current_seq:
                         templates.append(TemplateSequence(
                             name=current_name,
-                            sequence=''.join(current_seq),
+                            sequence=''.join(current_seq).upper().replace("U", "T"),
                             chromosome=current_chrom,
                             start_position=current_start,
                             end_position=current_end
@@ -874,7 +875,7 @@ class CRISPRPrimerDesigner:
             if current_name and current_seq:
                 templates.append(TemplateSequence(
                     name=current_name,
-                    sequence=''.join(current_seq),
+                    sequence=''.join(current_seq).upper().replace("U", "T"),
                     chromosome=current_chrom,
                     start_position=current_start,
                     end_position=current_end
@@ -888,7 +889,7 @@ class CRISPRPrimerDesigner:
         """Create a template from a sequence string"""
         return TemplateSequence(
             name=name,
-            sequence=sequence.upper().replace(" ", "").replace("\n", ""),
+            sequence=sequence.upper().replace(" ", "").replace("\n", "").replace("U", "T"),
             chromosome=chromosome,
             start_position=start_position,
             end_position=start_position + len(sequence) if start_position else None
@@ -1206,7 +1207,8 @@ class CRISPRPrimerDesigner:
     def design_primers(self, cutsites: List[CutSite],
                        templates: List[TemplateSequence],
                        output_prefix: str = "primers",
-                       output_dir: Optional[str] = None) -> List[Primer3OutputParser.Primer3Result]:
+                       output_dir: Optional[str] = None,
+                       bulk_format: str = "tsv") -> List[Primer3OutputParser.Primer3Result]:
         """
         Main method to design primers for all cut sites.
 
@@ -1261,7 +1263,8 @@ class CRISPRPrimerDesigner:
             self._save_snapgene_tsv(results, f"{base_output}_snapgene.tsv")
             
             # Save bulk order for oligo ordering
-            self._save_bulk_order_tsv(results, f"{base_output}_bulk_order.tsv")
+            bulk_ext = ".csv" if bulk_format == "csv" else ".tsv"
+            self._save_bulk_order(results, f"{base_output}_bulk_order{bulk_ext}", format=bulk_format)
 
             return results
 
@@ -1357,9 +1360,9 @@ class CRISPRPrimerDesigner:
         
         print(f"Saved SnapGene primer list: {output_file} ({len(seen_sequences)} unique primers)")
 
-    def _save_bulk_order_tsv(self, results: List[Primer3OutputParser.Primer3Result],
-                             output_file: str):
-        """Save bulk order TSV for oligo ordering with TruSeq adapters"""
+    def _save_bulk_order(self, results: List[Primer3OutputParser.Primer3Result],
+                         output_file: str, format: str = "tsv"):
+        """Save bulk order for oligo ordering with TruSeq adapters"""
         # TruSeq Adapters
         LEFT_ADAPTER = "ACACTCTTTCCCTACACGACGCTCTTCCGATCT"
         RIGHT_ADAPTER = "GACTGGAGTTCAGACGTGTGCTCTTCCGATCT"
@@ -1368,9 +1371,10 @@ class CRISPRPrimerDesigner:
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
         seen_sequences = set()
+        delimiter = ',' if format == 'csv' else '\t'
         
         with open(output_file, 'w', newline='') as f:
-            writer = csv.writer(f, delimiter='\t')
+            writer = csv.writer(f, delimiter=delimiter)
             for result in results:
                 for pair in result.primer_pairs:
                     # Left primer
@@ -1387,7 +1391,7 @@ class CRISPRPrimerDesigner:
                         writer.writerow([right_name, full_right, "25nm", "STD"])
                         seen_sequences.add(full_right)
         
-        print(f"Saved Bulk Order list: {output_file} ({len(seen_sequences)} oligos)")
+        print(f"Saved Bulk Order list ({format.upper()}): {output_file} ({len(seen_sequences)} oligos)")
 
 
 def create_example_files():
@@ -1485,6 +1489,8 @@ Examples:
                         help='Maximum melting temperature (default: 63.0)')
     parser.add_argument('--num-return', type=int, default=5,
                         help='Number of primer pairs to return (default: 5)')
+    parser.add_argument('--bulk-format', choices=['tsv', 'csv'], default='tsv',
+                        help='Format for bulk order file (default: tsv)')
     parser.add_argument('--target-distance', type=int, default=50,
                         help='Minimum distance from cut site to primer (default: 50bp)')
     parser.add_argument('--max-poly-x', type=int, default=3,
@@ -1606,7 +1612,7 @@ Examples:
         print(f"  primer3_core < {input_file} > {input_file.parent / (args.prefix + '_output.txt')}")
     else:
         # Full pipeline
-        results = designer.design_primers(cutsites, templates, args.prefix, args.output_dir)
+        results = designer.design_primers(cutsites, templates, args.prefix, args.output_dir, args.bulk_format)
 
         # Optional uniqueness check
         if args.check_uniqueness and args.genome:
@@ -1616,7 +1622,9 @@ Examples:
             # Save the filtered results again to ensure the TSV is updated
             out_file = f"{args.prefix}_primers.tsv"
             snap_file = f"{args.prefix}_snapgene.tsv"
-            bulk_file = f"{args.prefix}_bulk_order.tsv"
+            bulk_ext = ".csv" if args.bulk_format == "csv" else ".tsv"
+            bulk_file = f"{args.prefix}_bulk_order{bulk_ext}"
+            
             if args.output_dir:
                 out_file = str(Path(args.output_dir) / out_file)
                 snap_file = str(Path(args.output_dir) / snap_file)
@@ -1624,7 +1632,7 @@ Examples:
             
             designer._save_results_tsv(results, out_file)
             designer._save_snapgene_tsv(results, snap_file)
-            designer._save_bulk_order_tsv(results, bulk_file)
+            designer._save_bulk_order(results, bulk_file, format=args.bulk_format)
 
         # Optional location reporting
         if args.list_locations and args.genome:
