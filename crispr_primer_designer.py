@@ -20,6 +20,9 @@ import json
 import multiprocessing
 import time
 from functools import partial
+import gzip
+import shutil
+import urllib.request
 
 
 @dataclass
@@ -767,8 +770,6 @@ class CRISPRPrimerDesigner:
             
             common_paths = [
                 str(local_p3),
-                "/Users/munchr/bin/CRISPR_primer_designer/primer3/src/primer3_core",
-                "/Users/munchr/Documents/GitHub/CRISPR_primer_designer/primer3/src/primer3_core",
                 "/usr/local/bin/primer3_core",
                 "/usr/bin/primer3_core",
                 "/opt/homebrew/bin/primer3_core",
@@ -1431,6 +1432,78 @@ GCAGCTCCTACACCGGCGGCCCCTGCACCAGCCCCCTCCTGGCCCCTGTCATCTTCTGTCCCTTCCCAGAAAACCTACCA
     print("  - example_templates.fasta")
 
 
+# GRCh38 no-ALT analysis set from NCBI (UCSC chr-prefixed names, no ALT contigs, ~833 MB compressed).
+# This is the standard genome used by GATK/BWA pipelines. It includes chr1-22, chrX, chrY, chrM,
+# and unlocalized/unplaced scaffolds but EXCLUDES alternate loci (chr*_alt) that would cause
+# legitimate primer sequences to appear non-unique during the --check-uniqueness scan.
+HG38_URL = (
+    "https://ftp.ncbi.nlm.nih.gov/genomes/all/GCA/000/001/405/"
+    "GCA_000001405.15_GRCh38/seqs_for_alignment_pipelines.ucsc_ids/"
+    "GCA_000001405.15_GRCh38_no_alt_analysis_set.fna.gz"
+)
+HG38_CACHE_DIR = Path.home() / ".cache" / "crispr_primer_designer"
+HG38_CACHE_PATH = HG38_CACHE_DIR / "hg38_no_alt.fa"
+
+
+def download_hg38(dest: Path = HG38_CACHE_PATH) -> str:
+    """Download the GRCh38 no-ALT analysis set from NCBI and decompress it.
+
+    Uses UCSC-style chr-prefixed names and excludes ALT contigs, so primer
+    uniqueness checks reflect the primary assembly only.
+    The file is cached at *dest* so subsequent runs skip the download.
+    Returns the path to the decompressed FASTA as a string.
+    """
+    dest = Path(dest)
+    if dest.exists():
+        print(f"Using cached hg38 genome: {dest}")
+        return str(dest)
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    gz_path = dest.parent / (dest.stem + ".fna.gz")
+
+    print(f"Downloading GRCh38 no-ALT analysis set from NCBI (~833 MB compressed)...")
+    print(f"  Source : {HG38_URL}")
+    print(f"  Destination: {dest}")
+    print("  This only needs to happen once — the file will be cached for future runs.")
+    print()
+
+    def _progress(block_num, block_size, total_size):
+        downloaded = block_num * block_size
+        if total_size > 0:
+            pct = min(downloaded / total_size * 100, 100)
+            bar_len = 40
+            filled = int(bar_len * pct / 100)
+            bar = "#" * filled + "-" * (bar_len - filled)
+            mb_done = downloaded / 1_048_576
+            mb_total = total_size / 1_048_576
+            print(f"\r  [{bar}] {pct:5.1f}%  {mb_done:.0f}/{mb_total:.0f} MB", end="", flush=True)
+        else:
+            mb_done = downloaded / 1_048_576
+            print(f"\r  Downloaded {mb_done:.0f} MB...", end="", flush=True)
+
+    try:
+        urllib.request.urlretrieve(HG38_URL, gz_path, reporthook=_progress)
+    except Exception as e:
+        if gz_path.exists():
+            gz_path.unlink()
+        raise RuntimeError(f"Download failed: {e}") from e
+
+    print(f"\n  Download complete. Decompressing...")
+    try:
+        with gzip.open(gz_path, "rb") as f_in, open(dest, "wb") as f_out:
+            shutil.copyfileobj(f_in, f_out)
+    except Exception as e:
+        if dest.exists():
+            dest.unlink()
+        raise RuntimeError(f"Decompression failed: {e}") from e
+    finally:
+        if gz_path.exists():
+            gz_path.unlink()
+
+    print(f"  hg38 genome ready: {dest}")
+    return str(dest)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Design primers for CRISPR Cas9 cut site sequencing using Primer3",
@@ -1442,6 +1515,12 @@ Examples:
 
   # Specify custom product size range for different Illumina platforms
   python crispr_primer_designer.py -c cutsites.tsv -t templates.fasta --product-size "150-300"
+
+  # Auto-download hg38 from UCSC (first run only, then cached) and extract templates
+  python crispr_primer_designer.py -c cutsites.tsv --download-genome
+
+  # Use a locally installed hg38 FASTA directly
+  python crispr_primer_designer.py -c cutsites.tsv -g /path/to/hg38.fa
 
   # Create example files for testing
   python crispr_primer_designer.py --create-examples
@@ -1463,6 +1542,9 @@ Examples:
                         help='FASTA file with template sequences (can contain multiple sequences)')
     parser.add_argument('-g', '--genome',
                         help='Path to genome FASTA file (e.g. hg38.fa) for automatic template extraction')
+    parser.add_argument('--download-genome', action='store_true',
+                        help='Automatically download hg38 from UCSC (~870 MB compressed, cached after first use) '
+                             'and use it as the reference genome. Equivalent to -g ~/.cache/crispr_primer_designer/hg38.fa')
     parser.add_argument('-f', '--flank', type=int, default=250,
                         help='Flanking distance around cut site when extracting from genome (default: 250bp)')
     parser.add_argument('-p', '--prefix', default='primers',
@@ -1509,6 +1591,12 @@ Examples:
                         help='JSON file with Primer3 configuration')
 
     args = parser.parse_args()
+
+    # Resolve --download-genome: download hg38 (or use cache) and set args.genome
+    if args.download_genome:
+        if args.genome:
+            parser.error("--download-genome and --genome are mutually exclusive")
+        args.genome = download_hg38()
 
     # Create examples if requested
     if args.create_examples:

@@ -18,7 +18,7 @@ After designing primers, you can automatically calculate optimal annealing tempe
 python neb_tm_calculator.py path/to/your_primers.tsv
 ```
 
-See [NEB_TM_GUIDE.md](file:///Users/munchr/Documents/GitHub/CRISPR_primer_designer/NEB_TM_GUIDE.md) for more detailed options.
+See [NEB_TM_GUIDE.md](NEB_TM_GUIDE.md) for more detailed options.
 
 ## Prerequisites
 
@@ -49,12 +49,24 @@ See [NEB_TM_GUIDE.md](file:///Users/munchr/Documents/GitHub/CRISPR_primer_design
 The main tool is `crispr_primer_designer.py`. You can provide template sequences in two ways:
 
 #### Option A: Automatic Genomic Extraction (Recommended)
-Provide a TSV with genomic coordinates and a reference genome FASTA (e.g., `hg38.fa`). The script will automatically extract the surrounding region for each target.
+Provide a TSV with genomic coordinates and a reference genome FASTA. The script will automatically extract the surrounding region for each target.
+
+**Don't have hg38?** Use `--download-genome` to fetch the **GRCh38 no-ALT analysis set** automatically from NCBI (~833 MB compressed). This version excludes ALT contigs (`chr*_alt`) so that primer uniqueness checks reflect the primary assembly only — sequences that are unique in the primary assembly will not incorrectly fail because they also appear in an ALT contig. The file is cached at `~/.cache/crispr_primer_designer/hg38_no_alt.fa` after the first download. **It is safe to pass `--download-genome` on every run** — if the file is already cached the download is skipped instantly.
 
 ```bash
 python crispr_primer_designer.py \
   -c cutsites.tsv \
-  -g hg38/hg38.fa \
+  --download-genome \
+  -f 250 \
+  -o my_primers
+```
+
+If you already have a local copy of hg38 somewhere else, point to it with `-g` instead:
+
+```bash
+python crispr_primer_designer.py \
+  -c cutsites.tsv \
+  -g /path/to/hg38.fa \
   -f 250 \
   -o my_primers
 ```
@@ -96,7 +108,8 @@ A tab-separated file with at least these columns:
 - `-c`, `--cutsites`: Path to the TSV file with target information.
 - `--grna`: Directly provide a gRNA sequence (skips the need for `-c`).
 - `--grna-name`: Name/Label for the provided `--grna` (default: "gRNA").
-- `-g`, `--genome`: Path to genome FASTA for automatic extraction.
+- `-g`, `--genome`: Path to a local genome FASTA for automatic extraction.
+- `--download-genome`: Automatically download hg38 from UCSC (cached after first use). Mutually exclusive with `-g`.
 - `-f`, `--flank`: Flanking distance around cut site (default: 250bp).
 - `-t`, `--templates`: Path to the FASTA file with template sequences (can contain multiple records).
 - `--target-distance`: Minimum distance from cut site to primer (default: 50bp).
