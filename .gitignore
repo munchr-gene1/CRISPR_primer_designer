@@ -11,6 +11,8 @@ venv.bak/
 *.o
 *.a
 *.dSYM/
+neb_tm_calculator.py
+NEB_TM_GUIDE.md
 primer3/src/ntthal
 primer3/src/oligotm
 primer3/src/ntdpal

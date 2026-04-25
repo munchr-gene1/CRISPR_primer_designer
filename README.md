@@ -10,16 +10,6 @@ This repository provides tools to design optimized primers for sequencing CRISPR
 - **Thermodynamic Optimization**: Optimized for Illumina sequencing (MiSeq/NextSeq) with flexible parameters for Tm, GC content, and product size.
 - **Multiple Result Handling**: Returns multiple ranked primer pairs per target.
 
-## NEB Tm Calculation
-
-After designing primers, you can automatically calculate optimal annealing temperatures (Ta) and melting temperatures (Tm) for **Q5 Hot Start 2X Master Mix** using the NEB Tm API.
-
-```bash
-python neb_tm_calculator.py path/to/your_primers.tsv
-```
-
-See [NEB_TM_GUIDE.md](NEB_TM_GUIDE.md) for more detailed options.
-
 ## Prerequisites
 
 ### Tools
