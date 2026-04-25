@@ -1209,7 +1209,9 @@ class CRISPRPrimerDesigner:
                        templates: List[TemplateSequence],
                        output_prefix: str = "primers",
                        output_dir: Optional[str] = None,
-                       bulk_format: str = "tsv") -> List[Primer3OutputParser.Primer3Result]:
+                       bulk_format: str = "tsv",
+                       supplier: str = "idt",
+                       researcher_name: str = "") -> List[Primer3OutputParser.Primer3Result]:
         """
         Main method to design primers for all cut sites.
 
@@ -1264,8 +1266,13 @@ class CRISPRPrimerDesigner:
             self._save_snapgene_tsv(results, f"{base_output}_snapgene.tsv")
             
             # Save bulk order for oligo ordering
-            bulk_ext = ".csv" if bulk_format == "csv" else ".tsv"
-            self._save_bulk_order(results, f"{base_output}_bulk_order{bulk_ext}", format=bulk_format)
+            if supplier == "thermofisher":
+                self._save_bulk_order_thermofisher(
+                    results, f"{base_output}_bulk_order.txt",
+                    researcher_name=researcher_name)
+            else:
+                bulk_ext = ".csv" if bulk_format == "csv" else ".tsv"
+                self._save_bulk_order(results, f"{base_output}_bulk_order{bulk_ext}", format=bulk_format)
 
             return results
 
@@ -1363,17 +1370,17 @@ class CRISPRPrimerDesigner:
 
     def _save_bulk_order(self, results: List[Primer3OutputParser.Primer3Result],
                          output_file: str, format: str = "tsv"):
-        """Save bulk order for oligo ordering with TruSeq adapters"""
+        """Save IDT bulk order file with TruSeq adapters (Name, Sequence, Scale, Purification)"""
         # TruSeq Adapters
         LEFT_ADAPTER = "ACACTCTTTCCCTACACGACGCTCTTCCGATCT"
         RIGHT_ADAPTER = "GACTGGAGTTCAGACGTGTGCTCTTCCGATCT"
-        
+
         output_path = Path(output_file)
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
         seen_sequences = set()
         delimiter = ',' if format == 'csv' else '\t'
-        
+
         with open(output_file, 'w', newline='') as f:
             writer = csv.writer(f, delimiter=delimiter)
             for result in results:
@@ -1384,15 +1391,67 @@ class CRISPRPrimerDesigner:
                         left_name = f"{result.sequence_id}_{pair.pair_index}_L"
                         writer.writerow([left_name, full_left, "25nm", "STD"])
                         seen_sequences.add(full_left)
-                    
+
                     # Right primer
                     full_right = RIGHT_ADAPTER + pair.right_sequence
                     if full_right not in seen_sequences:
                         right_name = f"{result.sequence_id}_{pair.pair_index}_R"
                         writer.writerow([right_name, full_right, "25nm", "STD"])
                         seen_sequences.add(full_right)
-        
-        print(f"Saved Bulk Order list ({format.upper()}): {output_file} ({len(seen_sequences)} oligos)")
+
+        print(f"Saved IDT Bulk Order list ({format.upper()}): {output_file} ({len(seen_sequences)} oligos)")
+
+    def _save_bulk_order_thermofisher(self, results: List[Primer3OutputParser.Primer3Result],
+                                      output_file: str,
+                                      researcher_name: str = "",
+                                      synthesis_scale: str = "25N",
+                                      purification: str = "DSL"):
+        """Save ThermoFisher tube order file with TruSeq adapters.
+
+        Columns match the 'Tube Template' tab of the ThermoFisher bulk upload XLS:
+          Oligo sequence | Oligo name | Researcher Name | Synthesis scale |
+          5' Mod | 3' Mod | Purification | Special Handling
+        """
+        LEFT_ADAPTER = "ACACTCTTTCCCTACACGACGCTCTTCCGATCT"
+        RIGHT_ADAPTER = "GACTGGAGTTCAGACGTGTGCTCTTCCGATCT"
+
+        output_path = Path(output_file)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        seen_sequences = set()
+
+        with open(output_file, 'w', newline='') as f:
+            writer = csv.writer(f, delimiter='\t')
+            # Header matching the ThermoFisher Tube Template tab
+            writer.writerow([
+                "Oligo sequence (5' to 3') Mandatory Field",
+                "Oligo name Mandatory Field",
+                "Researcher Name Mandatory Field",
+                "Synthesis scale (use drop-down)",
+                "5 ' Mod (use drop-down)",
+                "3' Mod (use drop-down)",
+                "Purification (use drop-down)",
+                "Special Handling You may enter more than one separated by commas and no spaces",
+            ])
+            for result in results:
+                for pair in result.primer_pairs:
+                    # Left primer
+                    full_left = LEFT_ADAPTER + pair.left_sequence
+                    if full_left not in seen_sequences:
+                        left_name = f"{result.sequence_id}_{pair.pair_index}_L"
+                        writer.writerow([full_left, left_name, researcher_name,
+                                         synthesis_scale, "", "", purification, ""])
+                        seen_sequences.add(full_left)
+
+                    # Right primer
+                    full_right = RIGHT_ADAPTER + pair.right_sequence
+                    if full_right not in seen_sequences:
+                        right_name = f"{result.sequence_id}_{pair.pair_index}_R"
+                        writer.writerow([full_right, right_name, researcher_name,
+                                         synthesis_scale, "", "", purification, ""])
+                        seen_sequences.add(full_right)
+
+        print(f"Saved ThermoFisher Bulk Order (.txt): {output_file} ({len(seen_sequences)} oligos)")
 
 
 def create_example_files():
@@ -1522,6 +1581,9 @@ Examples:
   # Use a locally installed hg38 FASTA directly
   python crispr_primer_designer.py -c cutsites.tsv -g /path/to/hg38.fa
 
+  # Generate a ThermoFisher tube order file instead of IDT
+  python crispr_primer_designer.py -c cutsites.tsv -t templates.fasta --supplier thermofisher --researcher-name "Jane Doe"
+
   # Create example files for testing
   python crispr_primer_designer.py --create-examples
 
@@ -1572,7 +1634,12 @@ Examples:
     parser.add_argument('--num-return', type=int, default=5,
                         help='Number of primer pairs to return (default: 5)')
     parser.add_argument('--bulk-format', choices=['tsv', 'csv'], default='tsv',
-                        help='Format for bulk order file (default: tsv)')
+                        help='Format for IDT bulk order file (default: tsv); ignored when --supplier=thermofisher')
+    parser.add_argument('--supplier', choices=['idt', 'thermofisher'], default='idt',
+                        help='Oligo supplier format for bulk order output (default: idt)')
+    parser.add_argument('--researcher-name', default='',
+                        help='Researcher name for ThermoFisher order form (required by ThermoFisher; '
+                             'blank if omitted)')
     parser.add_argument('--target-distance', type=int, default=50,
                         help='Minimum distance from cut site to primer (default: 50bp)')
     parser.add_argument('--max-poly-x', type=int, default=3,
@@ -1699,8 +1766,19 @@ Examples:
         print("Run Primer3 manually with:")
         print(f"  primer3_core < {input_file} > {input_file.parent / (args.prefix + '_output.txt')}")
     else:
+        # Warn if ThermoFisher selected without a researcher name
+        if args.supplier == "thermofisher" and not args.researcher_name:
+            print("Warning: --researcher-name is required by ThermoFisher order forms but was not provided.")
+            print("         The 'Researcher Name' column will be left blank. Add --researcher-name 'Your Name'")
+            print("         to populate it.")
+
         # Full pipeline
-        results = designer.design_primers(cutsites, templates, args.prefix, args.output_dir, args.bulk_format)
+        results = designer.design_primers(
+            cutsites, templates, args.prefix, args.output_dir,
+            bulk_format=args.bulk_format,
+            supplier=args.supplier,
+            researcher_name=args.researcher_name,
+        )
 
         # Optional uniqueness check
         if args.check_uniqueness and args.genome:
@@ -1710,17 +1788,26 @@ Examples:
             # Save the filtered results again to ensure the TSV is updated
             out_file = f"{args.prefix}_primers.tsv"
             snap_file = f"{args.prefix}_snapgene.tsv"
-            bulk_ext = ".csv" if args.bulk_format == "csv" else ".tsv"
-            bulk_file = f"{args.prefix}_bulk_order{bulk_ext}"
-            
+
             if args.output_dir:
                 out_file = str(Path(args.output_dir) / out_file)
                 snap_file = str(Path(args.output_dir) / snap_file)
-                bulk_file = str(Path(args.output_dir) / bulk_file)
-            
+
             designer._save_results_tsv(results, out_file)
             designer._save_snapgene_tsv(results, snap_file)
-            designer._save_bulk_order(results, bulk_file, format=args.bulk_format)
+
+            if args.supplier == "thermofisher":
+                bulk_file = f"{args.prefix}_bulk_order.txt"
+                if args.output_dir:
+                    bulk_file = str(Path(args.output_dir) / bulk_file)
+                designer._save_bulk_order_thermofisher(
+                    results, bulk_file, researcher_name=args.researcher_name)
+            else:
+                bulk_ext = ".csv" if args.bulk_format == "csv" else ".tsv"
+                bulk_file = f"{args.prefix}_bulk_order{bulk_ext}"
+                if args.output_dir:
+                    bulk_file = str(Path(args.output_dir) / bulk_file)
+                designer._save_bulk_order(results, bulk_file, format=args.bulk_format)
 
         # Optional location reporting
         if args.list_locations and args.genome:
