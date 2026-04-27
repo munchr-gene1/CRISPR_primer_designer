@@ -13,6 +13,7 @@ import csv
 import subprocess
 import os
 import re
+import sys
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Tuple
@@ -506,9 +507,9 @@ def _scan_chunk_worker(chunk_info, sequences, return_locations=False):
 class ParallelGenomeScanner:
     """Multi-processed scanner to count sequence occurrences or find locations in a FASTA file"""
 
-    def __init__(self, genome_fa: str, num_processes: Optional[int] = None):
+    def __init__(self, genome_fa: str, num_processes: int = 1):
         self.genome_fa = genome_fa
-        self.num_processes = num_processes or multiprocessing.cpu_count()
+        self.num_processes = multiprocessing.cpu_count() if num_processes == 0 else num_processes
         self.chunk_size = 64 * 1024 * 1024  # 64MB chunks
         self.overlap = 1000  # 1kb overlap to handle primers crossing chunks
         
@@ -972,7 +973,7 @@ class CRISPRPrimerDesigner:
         return templates
 
     def filter_unique_primers(self, results: List[Primer3OutputParser.Primer3Result],
-                              genome_fa: str) -> List[Primer3OutputParser.Primer3Result]:
+                              genome_fa: str, num_processes: int = 1) -> List[Primer3OutputParser.Primer3Result]:
         """
         Filter out primer pairs where either primer is non-unique in the genome.
         """
@@ -994,7 +995,7 @@ class CRISPRPrimerDesigner:
                     primer_to_rc[seq_up] = rc
 
         # 2. Run parallel scan
-        scanner = ParallelGenomeScanner(genome_fa)
+        scanner = ParallelGenomeScanner(genome_fa, num_processes=num_processes)
         counts = scanner.count_occurrences(list(seq_to_check))
 
         # 3. Filter results
@@ -1036,7 +1037,7 @@ class CRISPRPrimerDesigner:
         return filtered_results
 
     def report_primer_locations(self, results: List[Primer3OutputParser.Primer3Result],
-                                genome_fa: str, output_file: str):
+                                genome_fa: str, output_file: str, num_processes: int = 1):
         """
         Find and report all genomic locations for all primers in the results.
         Saves to a TSV file.
@@ -1057,7 +1058,7 @@ class CRISPRPrimerDesigner:
                     primer_to_rc[seq_up] = rc
 
         # 2. Find all locations
-        scanner = ParallelGenomeScanner(genome_fa)
+        scanner = ParallelGenomeScanner(genome_fa, num_processes=num_processes)
         locs_found = scanner.find_locations(list(all_primers))
 
         # 3. Write report
@@ -1138,6 +1139,81 @@ class CRISPRPrimerDesigner:
         
         return filtered_results
 
+    def validate_locations(self, cutsites: List[CutSite],
+                           templates: List[TemplateSequence]) -> bool:
+        """
+        Cross-check each cut site's location against the template sequences.
+
+        For each cut site that has both a location and a gRNA sequence:
+          1. Find templates whose genomic coordinates overlap the stated location.
+          2. Confirm the gRNA sequence (or its reverse complement) is present in
+             at least one of those overlapping templates.
+
+        Issues are printed as warnings.  Returns False if any mismatch is found
+        so callers can decide whether to abort.
+        """
+        ig = self.input_generator
+        all_ok = True
+
+        for cs in cutsites:
+            if not cs.location or not cs.sequence:
+                continue
+
+            chrom, loc_start, loc_end = ig.parse_location(cs.location)
+
+            # Find templates that overlap this location (by chromosome + coordinates)
+            overlapping = []
+            for t in templates:
+                if chrom and t.chromosome:
+                    # Normalise chromosome names (strip leading "chr" for comparison)
+                    def _strip_chr(s):
+                        return s.lower().lstrip("chr")
+
+                    if _strip_chr(t.chromosome) != _strip_chr(chrom):
+                        continue
+                    if t.start_position is not None and t.end_position is not None:
+                        if loc_start is not None and loc_end is not None:
+                            if loc_end < t.start_position or loc_start > t.end_position:
+                                continue  # no overlap
+                    overlapping.append(t)
+                elif not chrom and not t.chromosome:
+                    # No coordinate info on either side – fall back to sequence scan
+                    overlapping.append(t)
+
+            if not overlapping:
+                # No template covers the stated location at all
+                print(
+                    f"\nWARNING: Location mismatch for '{cs.grna_name}'.\n"
+                    f"  Stated location : {cs.location}\n"
+                    f"  No loaded template overlaps this region.\n"
+                    f"  Check that the location in your TSV matches the template FASTA."
+                )
+                all_ok = False
+                continue
+
+            # Check that the gRNA sequence exists in at least one overlapping template
+            found_in_template = False
+            for t in overlapping:
+                hits = ig.find_sequence_in_template(cs.sequence, t.sequence)
+                if hits:
+                    found_in_template = True
+                    break
+
+            if not found_in_template:
+                print(
+                    f"\nWARNING: Sequence/location mismatch for '{cs.grna_name}'.\n"
+                    f"  gRNA sequence   : {cs.sequence}\n"
+                    f"  Stated location : {cs.location}\n"
+                    f"  The gRNA sequence was NOT found in any template that overlaps "
+                    f"the stated location.\n"
+                    f"  The location field may point to the wrong region, or the template\n"
+                    f"  FASTA may not cover the cut site. Primer3 will fall back to the\n"
+                    f"  location field to place the target, which could produce incorrect results."
+                )
+                all_ok = False
+
+        return all_ok
+
     def generate_all_inputs(self, cutsites: List[CutSite],
                             templates: List[TemplateSequence],
                             output_file: str = None) -> str:
@@ -1211,7 +1287,8 @@ class CRISPRPrimerDesigner:
                        output_dir: Optional[str] = None,
                        bulk_format: str = "tsv",
                        supplier: str = "idt",
-                       researcher_name: str = "") -> List[Primer3OutputParser.Primer3Result]:
+                       researcher_name: str = "",
+                       container: str = "tubes") -> List[Primer3OutputParser.Primer3Result]:
         """
         Main method to design primers for all cut sites.
 
@@ -1265,14 +1342,25 @@ class CRISPRPrimerDesigner:
             # Save simplified list for SnapGene
             self._save_snapgene_tsv(results, f"{base_output}_snapgene.tsv")
             
-            # Save bulk order for oligo ordering
-            if supplier == "thermofisher":
-                self._save_bulk_order_thermofisher(
-                    results, f"{base_output}_bulk_order.txt",
-                    researcher_name=researcher_name)
-            else:
-                bulk_ext = ".csv" if bulk_format == "csv" else ".tsv"
-                self._save_bulk_order(results, f"{base_output}_bulk_order{bulk_ext}", format=bulk_format)
+            # Save bulk / plate order for oligo ordering
+            if container == "plate":
+                if supplier == "thermofisher":
+                    self._save_plate_order_thermofisher(
+                        results, str(base_output), output_dir,
+                        researcher_name=researcher_name)
+                else:
+                    self._save_plate_order_idt(results, str(base_output), output_dir)
+            elif container == "plate-mixed":
+                self._save_plate_mixed_idt(results, str(base_output), output_dir)
+            else:  # tubes (default)
+                if supplier == "thermofisher":
+                    self._save_bulk_order_thermofisher(
+                        results, f"{base_output}_bulk_order.txt",
+                        researcher_name=researcher_name)
+                else:
+                    bulk_ext = ".csv" if bulk_format == "csv" else ".tsv"
+                    self._save_bulk_order(results, f"{base_output}_bulk_order{bulk_ext}",
+                                          format=bulk_format)
 
             return results
 
@@ -1453,34 +1541,227 @@ class CRISPRPrimerDesigner:
 
         print(f"Saved ThermoFisher Bulk Order (.txt): {output_file} ({len(seen_sequences)} oligos)")
 
+    # ------------------------------------------------------------------
+    # Plate order helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _well_label(oligo_index: int):
+        """Return (row_letter, col_int, plate_number) for a 0-based sequential oligo index.
+
+        Wells fill column-major (A1, B1, C1 … H1, A2, B2 …).
+        plate_number is 1-indexed; oligo_index rolls over every 96 wells.
+        """
+        ROWS = "ABCDEFGH"
+        plate = oligo_index // 96 + 1
+        pos = oligo_index % 96
+        row = ROWS[pos % 8]
+        col = pos // 8 + 1
+        return row, col, plate
+
+    def _save_plate_order_idt(self,
+                              results: List[Primer3OutputParser.Primer3Result],
+                              output_prefix: str,
+                              output_dir: Optional[str] = None):
+        """IDT individual plate order: Well Position, Name, Sequence.
+
+        Top pair only per cut site. L and R primers placed in consecutive
+        rows of the same column (A1/B1, C1/D1, …). Spills to additional
+        plate files when >96 wells are needed.
+        """
+        LEFT_ADAPTER = "ACACTCTTTCCCTACACGACGCTCTTCCGATCT"
+        RIGHT_ADAPTER = "GACTGGAGTTCAGACGTGTGCTCTTCCGATCT"
+
+        # Collect (oligo_index, name, sequence) tuples
+        oligos: List[tuple] = []
+        for result in results:
+            if not result.primer_pairs:
+                continue
+            pair = result.primer_pairs[0]  # top pair only
+            idx = len(oligos)
+            oligos.append((idx, f"{result.sequence_id}_{pair.pair_index}_L",
+                           LEFT_ADAPTER + pair.left_sequence))
+            oligos.append((idx + 1, f"{result.sequence_id}_{pair.pair_index}_R",
+                           RIGHT_ADAPTER + pair.right_sequence))
+
+        if not oligos:
+            print("No primers to write to plate file.")
+            return
+
+        # Group by plate number
+        plates: Dict[int, list] = {}
+        for i, (_, name, seq) in enumerate(oligos):
+            row, col, plate_num = self._well_label(i)
+            plates.setdefault(plate_num, []).append((f"{row}{col}", name, seq))
+
+        base = Path(output_prefix)
+        if output_dir:
+            base = Path(output_dir) / base.name
+
+        total_plates = len(plates)
+        for plate_num, rows in plates.items():
+            suffix = f"_{plate_num:02d}" if total_plates > 1 else ""
+            out_file = f"{base}_plate{suffix}.txt"
+            Path(out_file).parent.mkdir(parents=True, exist_ok=True)
+            with open(out_file, "w", newline="") as f:
+                writer = csv.writer(f, delimiter="\t")
+                writer.writerow(["Well Position", "Name", "Sequence"])
+                writer.writerows(rows)
+            print(f"Saved IDT Plate order (plate {plate_num}/{total_plates}): "
+                  f"{out_file} ({len(rows)} oligos)")
+
+        if total_plates > 1:
+            print(f"  Note: {len(oligos)} oligos across {total_plates} plates "
+                  f"({96 * (total_plates - 1) + len(plates[total_plates])} used on last plate).")
+
+    def _save_plate_order_thermofisher(self,
+                                       results: List[Primer3OutputParser.Primer3Result],
+                                       output_prefix: str,
+                                       output_dir: Optional[str] = None,
+                                       researcher_name: str = ""):
+        """ThermoFisher plate order: Plate name, Row, Column, Oligo name,
+        5' mod, Sequence, 3' mod.
+
+        Top pair only per cut site. L and R primers placed in consecutive
+        rows of the same column. Spills to additional plate files when
+        >96 wells are needed.
+        """
+        LEFT_ADAPTER = "ACACTCTTTCCCTACACGACGCTCTTCCGATCT"
+        RIGHT_ADAPTER = "GACTGGAGTTCAGACGTGTGCTCTTCCGATCT"
+
+        oligos: List[tuple] = []
+        for result in results:
+            if not result.primer_pairs:
+                continue
+            pair = result.primer_pairs[0]
+            idx = len(oligos)
+            oligos.append((idx, f"{result.sequence_id}_{pair.pair_index}_L",
+                           LEFT_ADAPTER + pair.left_sequence))
+            oligos.append((idx + 1, f"{result.sequence_id}_{pair.pair_index}_R",
+                           RIGHT_ADAPTER + pair.right_sequence))
+
+        if not oligos:
+            print("No primers to write to plate file.")
+            return
+
+        base = Path(output_prefix)
+        if output_dir:
+            base = Path(output_dir) / base.name
+
+        # Group by plate number; ThermoFisher uses a plate name column
+        plates: Dict[int, list] = {}
+        total_plates_estimate = (len(oligos) - 1) // 96 + 1
+        for i, (_, name, seq) in enumerate(oligos):
+            row, col, plate_num = self._well_label(i)
+            plate_label = f"{base.name}_{plate_num:02d}"
+            plates.setdefault(plate_num, []).append(
+                (plate_label, row, col, name, "", seq, ""))
+
+        total_plates = len(plates)
+        for plate_num, rows in plates.items():
+            suffix = f"_{plate_num:02d}" if total_plates > 1 else ""
+            out_file = f"{base}_tf_plate{suffix}.txt"
+            Path(out_file).parent.mkdir(parents=True, exist_ok=True)
+            with open(out_file, "w", newline="") as f:
+                writer = csv.writer(f, delimiter="\t")
+                writer.writerow([
+                    "Plate name",
+                    "Row",
+                    "Column",
+                    "Oligo name",
+                    "5' modification (use drop-down)",
+                    "Oligo sequence (5' to 3')",
+                    "3' modification (use drop-down)",
+                ])
+                writer.writerows(rows)
+            print(f"Saved ThermoFisher Plate order (plate {plate_num}/{total_plates}): "
+                  f"{out_file} ({len(rows)} oligos)")
+
+    def _save_plate_mixed_idt(self,
+                              results: List[Primer3OutputParser.Primer3Result],
+                              output_prefix: str,
+                              output_dir: Optional[str] = None):
+        """IDT mixed plate order: Well Position, Sequence Name, Sequence.
+
+        Top pair only per cut site. Both L and R primers for a pair share
+        the same well position (two rows per well). One cut site = one well.
+        Spills to additional plate files when >96 wells are needed.
+        """
+        LEFT_ADAPTER = "ACACTCTTTCCCTACACGACGCTCTTCCGATCT"
+        RIGHT_ADAPTER = "GACTGGAGTTCAGACGTGTGCTCTTCCGATCT"
+
+        # Each entry is a well: list of (well_pos_str, name, seq)
+        # well_index drives overflow — one well per cut site
+        rows_out: List[tuple] = []
+        well_index = 0
+        for result in results:
+            if not result.primer_pairs:
+                continue
+            pair = result.primer_pairs[0]
+            row, col, plate_num = self._well_label(well_index)
+            well_pos = f"{row}{col}"
+            rows_out.append((well_pos, plate_num,
+                             f"{result.sequence_id}_{pair.pair_index}_L",
+                             LEFT_ADAPTER + pair.left_sequence))
+            rows_out.append((well_pos, plate_num,
+                             f"{result.sequence_id}_{pair.pair_index}_R",
+                             RIGHT_ADAPTER + pair.right_sequence))
+            well_index += 1
+
+        if not rows_out:
+            print("No primers to write to mixed plate file.")
+            return
+
+        # Group by plate number
+        plates: Dict[int, list] = {}
+        for well_pos, plate_num, name, seq in rows_out:
+            plates.setdefault(plate_num, []).append((well_pos, name, seq))
+
+        base = Path(output_prefix)
+        if output_dir:
+            base = Path(output_dir) / base.name
+
+        total_plates = len(plates)
+        for plate_num, rows in plates.items():
+            suffix = f"_{plate_num:02d}" if total_plates > 1 else ""
+            out_file = f"{base}_mixed_plate{suffix}.txt"
+            Path(out_file).parent.mkdir(parents=True, exist_ok=True)
+            with open(out_file, "w", newline="") as f:
+                writer = csv.writer(f, delimiter="\t")
+                writer.writerow(["Well Position", "Sequence Name", "Sequence"])
+                writer.writerows(rows)
+            wells_used = len({r[0] for r in rows})
+            print(f"Saved IDT Mixed Plate order (plate {plate_num}/{total_plates}): "
+                  f"{out_file} ({wells_used} wells, {len(rows)} oligos)")
+
 
 def create_example_files():
     """Create example input files for testing"""
 
     # Example TSV file
     tsv_content = """Target gene\tgRNA name\tSequence\tlocation
-BRCA1\tBRCA1_gRNA1\tGCTGACTTACCAGATGGGAC\tchr17:43044295-43044314
-BRCA1\tBRCA1_gRNA2\tACTGGATCCAGATGACGTAC\tchr17:43045100-43045119
-TP53\tTP53_gRNA1\tGTCCAGATGACCAGGTGCAT\tchr17:7577000-7577019
+GENEA\tGENEA_gRNA1\tCGTAGCTTGACCATGAGCTA\tchr3:12540100-12540119
+GENEA\tGENEA_gRNA2\tTGACCGTACTGGATCAGCTT\tchr3:12541300-12541319
+GENEB\tGENEB_gRNA1\tATGCCAGTTGACTCGATGCC\tchr9:58200500-58200519
 """
 
     with open('example_cutsites.tsv', 'w') as f:
         f.write(tsv_content)
 
     # Example FASTA file with template sequences
-    fasta_content = """>BRCA1_region chr17:43044000-43051000
-ATGGATTTCTGCTGCTCGCGCTACTCTCTCTCTGTCTGGCCTGGAGGCTATCCAGCGTGAGTCTCTCCTACCCTCCCGCT
-GGGCCTGTAGCGGGGCTGTGGTCGCAGGGCCAACATAGGAGAAGAATCTCCCGGTTTGTCTGTCCACGCGCTCTGGCTGC
-TGAACGCCCTCTGCTCCCAGCTGGCAGCCAGGGAATGGCAGAAGGCAAGAACCCTCCCCTCCTCACCCTCATCACCGAGC
-CCGGCAGAAGCTCCCAGGATGCTGACTTTGTCACCAGTCCGGGAAGCTCTTGGCAGAAGACGCGGCAAGCAGCAGAGCGA
-GCTGACTTACCAGATGGGACAGGCTGCCCGCCGCCTCAGGAAGTAAGGAACTGCACGCTGGCGTGGTGGCTCACGCCTGT
-AATCCTAGCACTTTGGGAGGCCGAGGCGGGTGGATCATGAGGTCAGGAGATCGAGACCATCCTGGCTAACATGGTGAAAC
->TP53_region chr17:7576500-7578000
-GCCTGTCCTGGGAGAGACCGGCGCACAGAGGAAGAGAATCTCCGCAAGAAAGGGGAGCCTCACCACGAGCTGCCCCCAGG
-GCCCCAGGCCTCTGATTCCTCACTGATTGCTCTTAGGTCTGGCCCCTCCTCAGCATCTTATCCGAGTGGAAGGAAATTTG
-CGTGTGGAGTATTTGGATGACAGAAACACTTTTCGACATAGTGTGGTGGTGCCCTATGAGCCGCCTGAGGTTGGCTCTGA
-CTGTCCAGATGACCAGGTGCATGGTGCCAGCCCTGGCTCCCCAGAATGCAGAGGCTGCTCCCCCCGTGGCCCCTGCACCA
-GCAGCTCCTACACCGGCGGCCCCTGCACCAGCCCCCTCCTGGCCCCTGTCATCTTCTGTCCCTTCCCAGAAAACCTACCA
+    fasta_content = """>GENEA_region chr3:12539800-12541600
+TGACCGTACTAGCTTGACCATGAGCTAGTCAGCTTGACCGTACTGGATCAGCTTGATCGATCGTACGATCGATCGATCGAT
+CGATCGATCGATCGTAGCTTGACCATGAGCTAGTCAGCTTGACCGTACTGGATCAGCTTGATCGATCGTACGATCGATCGA
+TCGATCGATCGATCGTAGCTTGACCATGAGCTAGTCAGCTTGACCGTACTGGATCAGCTTGATCGATCGTACGATCGATCG
+ATCGATCGATCGATCGTAGCTTGACCATGAGCTAGTCAGCTTGACCGTACTGGATCAGCTTGATCGATCGTACGATCGATC
+GATCGATCGATCGATCGTAGCTTGACCATGAGCTAGTCAGCTTGACCGTACTGGATCAGCTTGATCGATCGTACGATCGAT
+CGATCGATCGATCGTAGCTTGACCATGAGCTAGTCAGCTTGACCGTACTGGATCAGCTTGATCGATCGTACGATCGATCGA
+>GENEB_region chr9:58200200-58201000
+ATGCCAGTTGACTCGATGCCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCT
+AGCTAGCTAGCTAGCTATGCCAGTTGACTCGATGCCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCT
+AGCTAGCTAGCTAGCTATGCCAGTTGACTCGATGCCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCT
+AGCTAGCTAGCTAGCTATGCCAGTTGACTCGATGCCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCT
+AGCTAGCTAGCTAGCTATGCCAGTTGACTCGATGCCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCT
 """
 
     with open('example_templates.fasta', 'w') as f:
@@ -1584,6 +1865,15 @@ Examples:
   # Generate a ThermoFisher tube order file instead of IDT
   python crispr_primer_designer.py -c cutsites.tsv -t templates.fasta --supplier thermofisher --researcher-name "Jane Doe"
 
+  # Generate an IDT individual plate order (top pair per cut site, consecutive-by-column layout)
+  python crispr_primer_designer.py -c cutsites.tsv -t templates.fasta --container plate
+
+  # Generate a ThermoFisher individual plate order
+  python crispr_primer_designer.py -c cutsites.tsv -t templates.fasta --container plate --supplier thermofisher --researcher-name "Jane Doe"
+
+  # Generate an IDT mixed plate order (L+R pooled per well)
+  python crispr_primer_designer.py -c cutsites.tsv -t templates.fasta --container plate-mixed
+
   # Create example files for testing
   python crispr_primer_designer.py --create-examples
 
@@ -1637,6 +1927,10 @@ Examples:
                         help='Format for IDT bulk order file (default: tsv); ignored when --supplier=thermofisher')
     parser.add_argument('--supplier', choices=['idt', 'thermofisher'], default='idt',
                         help='Oligo supplier format for bulk order output (default: idt)')
+    parser.add_argument('--container', choices=['tubes', 'plate', 'plate-mixed'], default='tubes',
+                        help='Output container format: tubes (default), '
+                             'plate (individual wells, IDT or ThermoFisher), '
+                             'plate-mixed (IDT pooled L+R pairs per well; IDT only)')
     parser.add_argument('--researcher-name', default='',
                         help='Researcher name for ThermoFisher order form (required by ThermoFisher; '
                              'blank if omitted)')
@@ -1648,6 +1942,8 @@ Examples:
                         help='Check that primers are unique in the genome (requires --genome)')
     parser.add_argument('--list-locations', action='store_true',
                         help='List all genomic locations for each primer (requires --genome)')
+    parser.add_argument('--parallel', type=int, default=1, metavar='N',
+                        help='Number of parallel processes for genome scanning (default: 1, 0 = all cores)')
 
     # Other options
     parser.add_argument('--create-examples', action='store_true',
@@ -1753,6 +2049,17 @@ Examples:
                     f.write(f">{t.name} {t.chromosome}:{t.start_position}-{t.end_position}\n{t.sequence}\n")
             print(f"  Saved templates to: {templates_path}")
 
+    # Validate that each cut site's location lines up with the loaded templates
+    if cutsites and templates:
+        ok = designer.validate_locations(cutsites, templates)
+        if not ok:
+            print(
+                "\nValidation found location/sequence mismatches (see warnings above).\n"
+                "Fix the 'location' column in your TSV (or the template FASTA) and re-run.\n"
+                "Aborting."
+            )
+            sys.exit(1)
+
     if args.input_only:
         # Just generate the input file
         filename = f"{args.prefix}_input.txt"
@@ -1772,18 +2079,24 @@ Examples:
             print("         The 'Researcher Name' column will be left blank. Add --researcher-name 'Your Name'")
             print("         to populate it.")
 
+        # Warn if plate-mixed requested with ThermoFisher (not yet supported)
+        if args.container == "plate-mixed" and args.supplier == "thermofisher":
+            print("Warning: --container plate-mixed is not yet supported for ThermoFisher.")
+            print("         Falling back to IDT mixed plate format.")
+
         # Full pipeline
         results = designer.design_primers(
             cutsites, templates, args.prefix, args.output_dir,
             bulk_format=args.bulk_format,
             supplier=args.supplier,
             researcher_name=args.researcher_name,
+            container=args.container,
         )
 
         # Optional uniqueness check
         if args.check_uniqueness and args.genome:
             print("\nVerifying primer uniqueness across the genome...")
-            results = designer.filter_unique_primers(results, args.genome)
+            results = designer.filter_unique_primers(results, args.genome, num_processes=args.parallel)
 
             # Save the filtered results again to ensure the TSV is updated
             out_file = f"{args.prefix}_primers.tsv"
@@ -1796,18 +2109,28 @@ Examples:
             designer._save_results_tsv(results, out_file)
             designer._save_snapgene_tsv(results, snap_file)
 
-            if args.supplier == "thermofisher":
-                bulk_file = f"{args.prefix}_bulk_order.txt"
-                if args.output_dir:
-                    bulk_file = str(Path(args.output_dir) / bulk_file)
-                designer._save_bulk_order_thermofisher(
-                    results, bulk_file, researcher_name=args.researcher_name)
-            else:
-                bulk_ext = ".csv" if args.bulk_format == "csv" else ".tsv"
-                bulk_file = f"{args.prefix}_bulk_order{bulk_ext}"
-                if args.output_dir:
-                    bulk_file = str(Path(args.output_dir) / bulk_file)
-                designer._save_bulk_order(results, bulk_file, format=args.bulk_format)
+            if args.container == "plate":
+                if args.supplier == "thermofisher":
+                    designer._save_plate_order_thermofisher(
+                        results, args.prefix, args.output_dir,
+                        researcher_name=args.researcher_name)
+                else:
+                    designer._save_plate_order_idt(results, args.prefix, args.output_dir)
+            elif args.container == "plate-mixed":
+                designer._save_plate_mixed_idt(results, args.prefix, args.output_dir)
+            else:  # tubes
+                if args.supplier == "thermofisher":
+                    bulk_file = f"{args.prefix}_bulk_order.txt"
+                    if args.output_dir:
+                        bulk_file = str(Path(args.output_dir) / bulk_file)
+                    designer._save_bulk_order_thermofisher(
+                        results, bulk_file, researcher_name=args.researcher_name)
+                else:
+                    bulk_ext = ".csv" if args.bulk_format == "csv" else ".tsv"
+                    bulk_file = f"{args.prefix}_bulk_order{bulk_ext}"
+                    if args.output_dir:
+                        bulk_file = str(Path(args.output_dir) / bulk_file)
+                    designer._save_bulk_order(results, bulk_file, format=args.bulk_format)
 
         # Optional location reporting
         if args.list_locations and args.genome:
@@ -1815,7 +2138,7 @@ Examples:
             loc_file = f"{args.prefix}_locations.tsv"
             if args.output_dir:
                 loc_file = str(Path(args.output_dir) / loc_file)
-            designer.report_primer_locations(results, args.genome, loc_file)
+            designer.report_primer_locations(results, args.genome, loc_file, num_processes=args.parallel)
 
         # Print summary
         print("\n" + "="*60)
